@@ -8,9 +8,14 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import org.eclipse.jgit.api.Git
 import org.eclipse.jgit.api.errors.GitAPIException
+import org.eclipse.jgit.errors.NoRemoteRepositoryException
+import org.eclipse.jgit.errors.TransportException
 import org.eclipse.jgit.lib.ProgressMonitor
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider
 import java.io.File
+import java.net.UnknownHostException
+import javax.net.ssl.SSLHandshakeException
+
 
 /**
  * Git-based Package Manager for Bountu
@@ -20,9 +25,13 @@ class GitPackageManager(private val context: Context) {
 
     companion object {
         private const val TAG = "GitPackageManager"
-    private const val DEFAULT_REPO_URL = "https://github.com/snmrdatobgstudioz9918-creator/bountu-packages-global.git"
+        // TEMP: point to a known public repo to verify Git works on device.
+        // Replace with your packages repo (must be public or provide credentials handling):
+        // e.g. "https://github.com/YOUR_USERNAME/bountu-packages.git"
+        private const val DEFAULT_REPO_URL = "https://github.com/snmrdatobgstudioz9918-creator/bountu-web-app.git"
         private const val LOCAL_REPO_DIR = "bountu-repo"
     }
+
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -61,9 +70,18 @@ class GitPackageManager(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize repository", e)
-            GitResult.Error("Initialization failed: ${e.message}")
+            val msg = when (e) {
+                is UnknownHostException -> "No internet or DNS issue (Unknown host)"
+                is SSLHandshakeException -> "SSL handshake failed (check network/clock)"
+                is NoRemoteRepositoryException -> "Repository not found or private"
+                is TransportException -> "Network/transport error: ${e.message}"
+                is GitAPIException -> "Git operation failed: ${e.message}"
+                else -> "Initialization failed: ${e.message}"
+            }
+            GitResult.Error(msg)
         }
     }
+
 
     /**
      * Clone a Git repository using JGit
@@ -100,12 +118,23 @@ class GitPackageManager(private val context: Context) {
             GitResult.Success(true)
         } catch (e: GitAPIException) {
             Log.e(TAG, "Git API exception during clone", e)
-            GitResult.Error("Clone failed: ${e.message}")
+            val msg = when (e) {
+                is NoRemoteRepositoryException -> "Repository not found or private"
+                is TransportException -> "Network/transport error: ${e.message}"
+                else -> "Clone failed: ${e.message}"
+            }
+            GitResult.Error(msg)
         } catch (e: Exception) {
             Log.e(TAG, "Clone exception", e)
-            GitResult.Error("Clone exception: ${e.message}")
+            val msg = when (e) {
+                is UnknownHostException -> "No internet or DNS issue (Unknown host)"
+                is SSLHandshakeException -> "SSL handshake failed (check network/clock)"
+                else -> "Clone exception: ${e.message}"
+            }
+            GitResult.Error(msg)
         }
     }
+
 
     /**
      * Sync repository (fetch and pull latest changes) using JGit

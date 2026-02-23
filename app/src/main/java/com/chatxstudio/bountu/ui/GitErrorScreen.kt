@@ -94,9 +94,11 @@ fun GitErrorScreen(
                         fontWeight = FontWeight.Bold
                     )
                     Text("• Check your internet connection", style = MaterialTheme.typography.bodySmall)
-                    Text("• Ensure Git is installed on your device", style = MaterialTheme.typography.bodySmall)
-                    Text("• Verify repository URL is correct", style = MaterialTheme.typography.bodySmall)
+                    Text("• Verify repository URL is correct and public", style = MaterialTheme.typography.bodySmall)
+                    Text("• Check internet/DNS is working", style = MaterialTheme.typography.bodySmall)
                     Text("• Try again in a few moments", style = MaterialTheme.typography.bodySmall)
+                    Text("• Note: JGit is bundled; no external Git install required", style = MaterialTheme.typography.bodySmall)
+
                 }
             }
 
