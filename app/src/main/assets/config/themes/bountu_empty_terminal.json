@@ -1,0 +1,31 @@
+{
+  "name": "Bountu Empty Terminal",
+  "background": "#1A1A1D",
+  "foreground": "#EAEAEA",
+  "cursor": "#00BFFF",
+  "selectionBackground": "#6A0DAD",
+  "lineHeight": 1.4,
+  "fontFamily": "Fira Code, monospace",
+  "fontSize": 16,
+  "cursorBlink": true,
+  "colors": {
+    "black": "#1A1A1D",
+    "red": "#FF4C4C",
+    "green": "#39FF14",
+    "yellow": "#FFD700",
+    "blue": "#00BFFF",
+    "magenta": "#6A0DAD",
+    "cyan": "#00FFE0",
+    "white": "#EAEAEA",
+    "brightBlack": "#555555",
+    "brightRed": "#FF6A6A",
+    "brightGreen": "#6CFF6C",
+    "brightYellow": "#FFFF7F",
+    "brightBlue": "#66CCFF",
+    "brightMagenta": "#AA66FF",
+    "brightCyan": "#66FFFF",
+    "brightWhite": "#FFFFFF"
+  },
+  "cursorShape": "block",
+  "bellStyle": "none"
+}

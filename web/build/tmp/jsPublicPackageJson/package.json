@@ -1,0 +1,17 @@
+{
+  "name": "bountu-web",
+  "version": "0.0.0-unspecified",
+  "main": "bountu-web.js",
+  "types": "bountu-web.d.ts",
+  "devDependencies": {
+    "webpack": "5.100.2",
+    "webpack-cli": "6.0.1",
+    "kotlin-web-helpers": "2.1.0",
+    "source-map-loader": "5.0.0",
+    "webpack-dev-server": "4.15.2"
+  },
+  "dependencies": {},
+  "peerDependencies": {},
+  "optionalDependencies": {},
+  "bundledDependencies": []
+}

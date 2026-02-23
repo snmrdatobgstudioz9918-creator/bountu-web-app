@@ -1,0 +1,682 @@
+package com.chatxstudio.bountu
+
+import android.Manifest
+import android.content.pm.PackageManager as AndroidPackageManager
+import android.os.Build
+import android.os.Bundle
+import android.util.Log
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import com.chatxstudio.bountu.communication.CommunicationManager
+import com.chatxstudio.bountu.git.GitPackageManager
+import com.chatxstudio.bountu.git.GitResult
+import com.chatxstudio.bountu.git.MaintenanceStatus
+import com.chatxstudio.bountu.network.ConnectionMonitor
+import com.chatxstudio.bountu.packages.PackageManager as BountuPackageManager
+import com.chatxstudio.bountu.security.SecurityManager
+import com.chatxstudio.bountu.service.BountuBackgroundService
+import com.chatxstudio.bountu.sync.AutoSyncManager
+import com.chatxstudio.bountu.sync.SyncResult
+import com.chatxstudio.bountu.sync.SyncState
+import com.chatxstudio.bountu.theme.AppTheme
+import com.chatxstudio.bountu.utils.BatteryOptimizationHelper
+import com.chatxstudio.bountu.theme.ThemeConfig
+import com.chatxstudio.bountu.theme.ThemeManager
+import com.chatxstudio.bountu.ui.GitErrorScreen
+import com.chatxstudio.bountu.ui.MainScreen
+import com.chatxstudio.bountu.ui.MaintenanceScreen
+import com.chatxstudio.bountu.ui.SyncErrorScreen
+import com.chatxstudio.bountu.ui.theme.BountuTheme
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+/**
+ * App states for navigation
+ */
+enum class AppState {
+    Initializing,
+    Syncing,
+    SyncError,
+    Ready
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        
+        // Start background service to keep app running
+        BountuBackgroundService.start(this)
+        
+        // Request battery optimization exemption to keep app running
+        if (!BatteryOptimizationHelper.isIgnoringBatteryOptimizations(this)) {
+            BatteryOptimizationHelper.requestIgnoreBatteryOptimizations(this)
+        }
+        
+        setContent {
+            val context = LocalContext.current
+            val scope = rememberCoroutineScope()
+            val communicationManager = remember { CommunicationManager(context) }
+            val securityManager = remember { SecurityManager(context) }
+            val themeManager = remember { ThemeManager(context) }
+            val gitManager = remember { GitPackageManager(context) }
+            val packageManager = remember { BountuPackageManager(context) }
+            val connectionMonitor = remember { ConnectionMonitor(context) }
+            val autoSyncManager = remember { AutoSyncManager(context, gitManager, connectionMonitor) }
+
+            // State
+            var appState by remember { mutableStateOf<AppState>(AppState.Initializing) }
+            var maintenanceStatus by remember { mutableStateOf<MaintenanceStatus?>(null) }
+            
+            // Collect states
+            val syncState by autoSyncManager.syncState.collectAsState()
+            val connectionState by connectionMonitor.connectionState.collectAsState()
+            val pingMs by connectionMonitor.pingMs.collectAsState()
+            
+            // Permission state
+            var permissionsGranted by remember { mutableStateOf(false) }
+            var showPermissionDialog by remember { mutableStateOf(false) }
+            
+            // Permission launcher
+            val permissionLauncher = rememberLauncherForActivityResult(
+                contract = ActivityResultContracts.RequestMultiplePermissions()
+            ) { permissions ->
+                permissionsGranted = permissions.values.all { it }
+                if (!permissionsGranted) {
+                    showPermissionDialog = true
+                }
+            }
+
+            // Check permissions on start
+            LaunchedEffect(Unit) {
+                val requiredPermissions = mutableListOf(
+                    Manifest.permission.INTERNET,
+                    Manifest.permission.ACCESS_NETWORK_STATE
+                )
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    requiredPermissions.add(Manifest.permission.POST_NOTIFICATIONS)
+                }
+                
+                val allGranted = requiredPermissions.all { permission ->
+                    ContextCompat.checkSelfPermission(context, permission) == AndroidPackageManager.PERMISSION_GRANTED
+                }
+                
+                if (allGranted) {
+                    permissionsGranted = true
+                } else {
+                    permissionLauncher.launch(requiredPermissions.toTypedArray())
+                }
+            }
+
+            // Load theme config reactively
+            val themeConfig by themeManager.getThemeConfigFlow().collectAsState(initial = ThemeConfig())
+
+            // Perform initial sync with connection monitoring
+            LaunchedEffect(Unit) {
+                try {
+                    appState = AppState.Syncing
+                    Log.d("MainActivity", "Starting initial sync...")
+                    
+                    // Perform sync with AutoSyncManager
+                    val syncResult = autoSyncManager.performInitialSync()
+                    
+                    when (syncResult) {
+                        is SyncResult.Success -> {
+                            Log.d("MainActivity", "Sync successful: ${syncResult.packageCount} packages")
+                            
+                            // Sync packages with package manager
+                            packageManager.syncPackagesFromGit()
+                            
+                            // Check maintenance status
+                            when (val statusResult = gitManager.getMaintenanceStatus()) {
+                                is GitResult.Success -> {
+                                    maintenanceStatus = statusResult.data
+                                    Log.d("MainActivity", "Maintenance status: ${statusResult.data}")
+                                }
+                                is GitResult.Error -> {
+                                    maintenanceStatus = MaintenanceStatus()
+                                    Log.w("MainActivity", "Using default maintenance status")
+                                }
+                            }
+                            
+                            appState = AppState.Ready
+                        }
+                        is SyncResult.Failed -> {
+                            Log.e("MainActivity", "Sync failed: ${syncResult.error.message}")
+                            appState = AppState.SyncError
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "Sync exception: ${e.message}", e)
+                    appState = AppState.SyncError
+                }
+            }
+            
+            // No need for manual loading cycle - sync manager handles it
+
+            AppTheme(themeManager = themeManager, themeConfig = themeConfig) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    Box(Modifier.fillMaxSize()) {
+                        // Render based on app state
+                        when (appState) {
+                            AppState.Initializing -> {
+                                LoadingScreen("Initializing...")
+                            }
+                            
+                            AppState.Syncing -> {
+                                // Show sync status with connection info
+                                SyncingScreen(
+                                    syncState = syncState,
+                                    connectionState = connectionState,
+                                    pingMs = pingMs
+                                )
+                            }
+                            
+                            AppState.SyncError -> {
+                                // Show sync error screen with retry
+                                SyncErrorScreen(
+                                    syncManager = autoSyncManager,
+                                    connectionMonitor = connectionMonitor,
+                                    onRetry = {
+                                        scope.launch {
+                                            appState = AppState.Syncing
+                                            val result = autoSyncManager.retrySync()
+                                            when (result) {
+                                                is SyncResult.Success -> {
+                                                    packageManager.syncPackagesFromGit()
+                                                    appState = AppState.Ready
+                                                }
+                                                is SyncResult.Failed -> {
+                                                    appState = AppState.SyncError
+                                                }
+                                            }
+                                        }
+                                    },
+                                    onExit = { finish() }
+                                )
+                            }
+                            
+                            AppState.Ready -> {
+                                // Check maintenance status
+                                if (maintenanceStatus?.isEnabled == true) {
+                                    MaintenanceScreen(
+                                        maintenanceStatus = maintenanceStatus!!,
+                                        onRetry = {
+                                            scope.launch {
+                                                when (val statusResult = gitManager.getMaintenanceStatus()) {
+                                                    is GitResult.Success -> {
+                                                        maintenanceStatus = statusResult.data
+                                                    }
+                                                    is GitResult.Error -> {
+                                                        maintenanceStatus = MaintenanceStatus()
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        onExit = { finish() }
+                                    )
+                                } else {
+                                    // Show main app
+                                    MainScreen(
+                                        packageManager = packageManager,
+                                        themeManager = themeManager,
+                                        onLogout = { /* Handle logout */ }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Loading screen
+ */
+@Composable
+fun LoadingScreen(message: String) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            CircularProgressIndicator()
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodyLarge
+            )
+        }
+    }
+}
+
+/**
+ * Syncing screen with connection info
+ */
+@Composable
+fun SyncingScreen(
+    syncState: SyncState,
+    connectionState: com.chatxstudio.bountu.network.ConnectionState,
+    pingMs: Long?
+) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            modifier = Modifier.padding(24.dp)
+        ) {
+            CircularProgressIndicator()
+            
+            Text(
+                text = when (syncState) {
+                    is SyncState.Checking -> "Checking connection..."
+                    is SyncState.Syncing -> "Syncing... (${syncState.attempt}/${syncState.maxAttempts})"
+                    is SyncState.Retrying -> "Retrying... (${syncState.attempt}/${syncState.maxAttempts})"
+                    else -> "Syncing with repository..."
+                },
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold
+            )
+            
+            Spacer(modifier = Modifier.height(8.dp))
+            
+            // Connection info card
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp)
+                ) {
+                    Text(
+                        text = "Connection Status",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Network:")
+                        Text(
+                            text = when (connectionState) {
+                                is com.chatxstudio.bountu.network.ConnectionState.Connected -> "Connected"
+                                is com.chatxstudio.bountu.network.ConnectionState.Disconnected -> "Disconnected"
+                                is com.chatxstudio.bountu.network.ConnectionState.Limited -> "Limited"
+                                else -> "Checking..."
+                            },
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Ping:")
+                        Text(
+                            text = if (pingMs != null) "${pingMs}ms" else "N/A",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Loading screen composable
+ */
+@Composable
+fun LoadingScreen(message: String) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            CircularProgressIndicator()
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodyLarge
+            )
+        }
+    }
+}
+                                // Show maintenance screen - app won't work
+                                MaintenanceScreen(
+                                    maintenanceStatus = maintenanceStatus!!,
+                                    onRetry = {
+                                        scope.launch {
+                                            showLoading = true
+                                            when (val result = gitManager.getMaintenanceStatus()) {
+                                                is GitResult.Success -> {
+                                                    maintenanceStatus = result.data
+                                                }
+                                                is GitResult.Error -> {
+                                                    maintenanceStatus = MaintenanceStatus()
+                                                }
+                                            }
+                                            showLoading = false
+                                        }
+                                    }
+                                )
+                            }
+                            permissionsGranted -> {
+                                // Normal app flow
+                                MainScreen(
+                                    communicationManager = communicationManager,
+                                    securityManager = securityManager,
+                                    themeManager = themeManager
+                                )
+                            }
+                            else -> {
+                                // Show permission screen
+                                PermissionRequiredScreen(
+                                    onRequestPermissions = {
+                                        val requiredPermissions = mutableListOf(
+                                            Manifest.permission.INTERNET,
+                                            Manifest.permission.ACCESS_NETWORK_STATE
+                                        )
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                            requiredPermissions.add(Manifest.permission.POST_NOTIFICATIONS)
+                                        }
+                                        permissionLauncher.launch(requiredPermissions.toTypedArray())
+                                    }
+                                )
+                            }
+                        }
+
+                        // Show loading screen on top when loading
+                        if (showLoading && gitError == null) {
+                            EnhancedLoadingScreen(progress = loadingProgress)
+                        }
+                    }
+                    
+                    // Permission dialog
+                    if (showPermissionDialog) {
+                        AlertDialog(
+                            onDismissRequest = { showPermissionDialog = false },
+                            title = { Text("Permissions Required") },
+                            text = { Text("Some permissions were denied. The app may not function properly without them.") },
+                            confirmButton = {
+                                Button(onClick = { showPermissionDialog = false }) {
+                                    Text("OK")
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun EnhancedLoadingScreen(progress: Float) {
+    // Glowing animation for colors
+    val infiniteTransition = rememberInfiniteTransition(label = "glow")
+    val glowAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.4f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1500, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "alpha"
+    )
+    
+    val colorOffset by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(3000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "color_offset"
+    )
+    
+    // Scale animation for logo
+    val scale by infiniteTransition.animateFloat(
+        initialValue = 0.95f,
+        targetValue = 1.05f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(2000, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "scale"
+    )
+    
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0xFF0D1117),
+                        Color(0xFF161B22),
+                        Color(0xFF0D1117)
+                    )
+                )
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            // App name with glow effect
+            Text(
+                text = "BOUNTU",
+                style = TextStyle(
+                    fontSize = 48.sp,
+                    fontWeight = FontWeight.Bold,
+                    brush = Brush.linearGradient(
+                        colors = listOf(
+                            Color(0xFF00D9FF).copy(alpha = glowAlpha),
+                            Color(0xFF7B2FFF).copy(alpha = glowAlpha),
+                            Color(0xFFFF006E).copy(alpha = glowAlpha)
+                        )
+                    )
+                ),
+                modifier = Modifier.scale(scale)
+            )
+            
+            Spacer(modifier = Modifier.height(32.dp))
+            
+            // Progress indicator
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier
+                    .width(200.dp)
+                    .height(4.dp),
+                color = Color(0xFF00D9FF).copy(alpha = glowAlpha),
+                trackColor = Color.White.copy(alpha = 0.2f)
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            Text(
+                text = "${(progress * 100).toInt()}%",
+                style = TextStyle(
+                    fontSize = 14.sp,
+                    color = Color.White.copy(alpha = 0.7f)
+                )
+            )
+            
+            Spacer(modifier = Modifier.height(64.dp))
+            
+            // "Made by" text with glowing effect
+            Text(
+                text = "made by SN-Mrdatobg",
+                style = TextStyle(
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium,
+                    brush = Brush.linearGradient(
+                        colors = listOf(
+                            Color(0xFFFFD700).copy(alpha = glowAlpha),
+                            Color(0xFFFF8C00).copy(alpha = glowAlpha),
+                            Color(0xFFFF1493).copy(alpha = glowAlpha),
+                            Color(0xFF00CED1).copy(alpha = glowAlpha)
+                        ),
+                        start = androidx.compose.ui.geometry.Offset(colorOffset * 1000, 0f),
+                        end = androidx.compose.ui.geometry.Offset((colorOffset + 0.5f) * 1000, 0f)
+                    )
+                )
+            )
+        }
+    }
+}
+
+@Composable
+fun PermissionRequiredScreen(onRequestPermissions: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(32.dp)
+        ) {
+            Icon(
+                imageVector = androidx.compose.material.icons.Icons.Filled.Lock,
+                contentDescription = "Permissions",
+                modifier = Modifier.size(64.dp),
+                tint = MaterialTheme.colorScheme.primary
+            )
+            
+            Spacer(modifier = Modifier.height(24.dp))
+            
+            Text(
+                text = "Permissions Required",
+                style = MaterialTheme.typography.headlineMedium,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            Text(
+                text = "Bountu needs the following permissions to function properly:",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
+            )
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    PermissionItem("Internet", "Required for communication with Windows")
+                    Spacer(modifier = Modifier.height(8.dp))
+                    PermissionItem("Network State", "Check network connectivity")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        PermissionItem("Notifications", "Show important alerts")
+                    }
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(24.dp))
+            
+            Button(
+                onClick = onRequestPermissions,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Grant Permissions")
+            }
+        }
+    }
+}
+
+@Composable
+fun PermissionItem(title: String, description: String) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = androidx.compose.material.icons.Icons.Filled.Check,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Column {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+            )
+        }
+    }
+}
+
+@Preview(showBackground = true)
+@Composable
+fun MainActivityPreview() {
+    BountuTheme {
+        val context = LocalContext.current
+        val communicationManager = CommunicationManager(context)
+        val securityManager = SecurityManager(context)
+        val themeManager = ThemeManager(context)
+        
+        MainScreen(
+            communicationManager = communicationManager,
+            securityManager = securityManager,
+            themeManager = themeManager
+        )
+    }
+}
